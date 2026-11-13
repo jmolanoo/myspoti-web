@@ -93,7 +93,7 @@ export function PlayerProvider({ children }) {
     }).catch(() => {});
 
     // Stream URL resolution: direct audio URL, preview URL or fallback audio
-    const streamUrl = track.audioUrl || track.previewUrl || `/api/audio/stream/${encodeURIComponent(track.uri || track.id)}`;
+    const streamUrl = track.audioUrl || track.previewUrl || `/api/audio/stream/${encodeURIComponent(track.uri || track.id)}?q=${encodeURIComponent(`${track.title || ''} ${track.artist || ''}`)}&duration=${Math.round((track.durationMs || 0) / 1000)}`;
     try {
       await audioEngine.play(track, streamUrl);
       setIsPlaying(true);

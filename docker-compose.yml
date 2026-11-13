@@ -1,0 +1,35 @@
+services:
+  myspoti-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: myspoti-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DB_PATH=/app/data/myspoti_local.db
+    volumes:
+      - myspoti_data:/app/data
+    networks:
+      - myspoti-net
+
+  myspoti-tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: myspoti-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://myspoti-web:3000
+    depends_on:
+      myspoti-web:
+        condition: service_healthy
+    networks:
+      - myspoti-net
+
+volumes:
+  myspoti_data:
+
+networks:
+  myspoti-net:
+    driver: bridge

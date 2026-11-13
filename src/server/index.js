@@ -1,9 +1,11 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import fastifyCors from '@fastify/cors';
 import fastifyRateLimit from '@fastify/rate-limit';
+import { fetch } from 'undici';
 import { createDatabase } from './db.js';
 import { SpotifyBffService } from './spotify/SpotifyBffService.js';
 
@@ -12,6 +14,7 @@ const __dirname = path.dirname(__filename);
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', '..', 'myspoti_local.db');
 
 const fastify = Fastify({
   logger: {
@@ -31,7 +34,7 @@ await fastify.register(fastifyRateLimit, {
 });
 
 // 2. Initialize Database & Spotify BFF
-const db = createDatabase(path.join(__dirname, '..', '..', 'myspoti_local.db'));
+const db = createDatabase(DB_PATH);
 const spotifyBff = new SpotifyBffService({
   opsPath: path.join(__dirname, 'spotify', 'gql-ops.json'),
   varsPath: path.join(__dirname, 'spotify', 'gql-variables.json')
@@ -48,6 +51,113 @@ fastify.get('/api/health', async () => {
   };
 });
 
+// --- Audio Stream Resolver (SoundCloud / Full Music streaming via yt-dlp & FFmpeg) ---
+const streamCache = new Map();
+
+async function resolveAudioStream(query, targetDuration = null) {
+  if (!query) return null;
+  const cacheKey = query.trim().toLowerCase();
+  const cached = streamCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.directUrl;
+  }
+
+  return new Promise((resolve) => {
+    const child = spawn('yt-dlp', [
+      '--dump-json',
+      '--no-warnings',
+      '--flat-playlist',
+      `scsearch5:${query}`
+    ]);
+    let out = '';
+    child.stdout.on('data', chunk => { out += chunk; });
+    child.on('close', () => {
+      const lines = out.trim().split('\n').filter(Boolean);
+      const candidates = [];
+      for (const line of lines) {
+        try {
+          const item = JSON.parse(line);
+          if ((item.duration || 0) >= 45 && item.url) candidates.push(item);
+        } catch (e) {}
+      }
+      if (candidates.length === 0) return resolve(null);
+      if (targetDuration && targetDuration > 30) {
+        candidates.sort((a, b) => Math.abs((a.duration || 0) - targetDuration) - Math.abs((b.duration || 0) - targetDuration));
+      }
+      const best = candidates[0];
+
+      const getUrl = spawn('yt-dlp', ['-g', '-f', 'bestaudio', best.url]);
+      let urlOut = '';
+      getUrl.stdout.on('data', chunk => { urlOut += chunk; });
+      getUrl.on('close', () => {
+        const directUrl = urlOut.trim().split('\n')[0];
+        if (directUrl && directUrl.startsWith('http')) {
+          streamCache.set(cacheKey, {
+            directUrl,
+            duration: best.duration,
+            expiresAt: Date.now() + 4 * 3600 * 1000
+          });
+          resolve(directUrl);
+        } else {
+          resolve(null);
+        }
+      });
+      getUrl.on('error', () => resolve(null));
+    });
+    child.on('error', () => resolve(null));
+  });
+}
+
+// Fallback search formatting from Deezer to match Spotify GQL schema
+async function searchDeezerFallback(q, limit = 20) {
+  try {
+    const res = await fetch(`https://api.deezer.com/search/track?q=${encodeURIComponent(q)}&limit=${limit}`);
+    if (!res.ok) return { tracks: [] };
+    const json = await res.json();
+    const tracks = (json.data || []).map(t => ({
+      matchedFields: [],
+      item: {
+        data: {
+          __typename: 'Track',
+          uri: `spotify:track:${t.id}`,
+          id: String(t.id),
+          name: t.title,
+          duration: { totalMilliseconds: (t.duration || 180) * 1000 },
+          albumOfTrack: {
+            uri: `spotify:album:${t.album?.id || ''}`,
+            name: t.album?.title || '',
+            coverArt: {
+              sources: [
+                { url: t.album?.cover_xl || t.album?.cover_big || t.album?.cover_medium || '' }
+              ]
+            }
+          },
+          artists: {
+            items: [
+              {
+                uri: `spotify:artist:${t.artist?.id || ''}`,
+                profile: { name: t.artist?.name || 'Artista' }
+              }
+            ]
+          }
+        }
+      }
+    }));
+    return {
+      data: {
+        searchV2: {
+          tracksV2: {
+            totalCount: tracks.length,
+            items: tracks
+          }
+        }
+      }
+    };
+  } catch (e) {
+    return { tracks: [] };
+  }
+}
+
 // 4. Spotify BFF Routes
 
 // 4.1 Search
@@ -58,13 +168,15 @@ fastify.get('/api/spotify/search', async (req, reply) => {
   try {
     if (type === 'tracks') {
       const res = await spotifyBff.getSearchTracks(q, parseInt(offset), parseInt(limit));
-      return res;
+      if (res && res.data && res.data.searchV2) return res;
+      return await searchDeezerFallback(q, parseInt(limit));
     }
     const res = await spotifyBff.getSearchTop(q, parseInt(limit));
-    return res;
+    if (res && res.data) return res;
+    return await searchDeezerFallback(q, parseInt(limit));
   } catch (err) {
-    req.log.error(err);
-    return reply.status(500).send({ error: err.message });
+    req.log.warn(`Spotify search fallback triggered for "${q}": ${err.message}`);
+    return await searchDeezerFallback(q, parseInt(limit));
   }
 });
 
@@ -77,8 +189,22 @@ fastify.get('/api/spotify/suggestions', async (req) => {
       searchTerm: q,
       includeAudiobooks: false
     });
-    return res;
+    if (res && res.data && res.data.searchSuggestions) return res;
+    throw new Error('Fallback needed');
   } catch (err) {
+    try {
+      const dzRes = await fetch(`https://api.deezer.com/search/track?q=${encodeURIComponent(q)}&limit=5`);
+      if (dzRes.ok) {
+        const json = await dzRes.json();
+        return {
+          data: {
+            searchSuggestions: {
+              items: (json.data || []).map(t => ({ name: `${t.title} - ${t.artist?.name}` }))
+            }
+          }
+        };
+      }
+    } catch (e) {}
     return { suggestions: [] };
   }
 });
@@ -143,6 +269,87 @@ fastify.post('/api/spotify/gql/:opName', async (req, reply) => {
   } catch (err) {
     return reply.status(500).send({ error: err.message });
   }
+});
+
+// --- Audio Streaming Endpoints ---
+
+// 4.9 Full Progressive MP3 stream (/api/stream)
+fastify.get('/api/stream', async (req, reply) => {
+  const { q, duration, seek } = req.query;
+  if (!q) return reply.status(400).send({ error: 'Missing query parameter q' });
+
+  const directAudioUrl = await resolveAudioStream(q, duration ? Number(duration) : null);
+  if (!directAudioUrl) {
+    return reply.status(404).send({ error: 'Full audio stream could not be resolved' });
+  }
+
+  const seekSeconds = seek ? Number(seek) : 0;
+  const ffmpegArgs = [
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+    '-i', directAudioUrl
+  ];
+  if (seekSeconds > 0) ffmpegArgs.push('-ss', String(seekSeconds));
+  ffmpegArgs.push('-vn', '-c:a', 'libmp3lame', '-b:a', '192k', '-f', 'mp3', '-');
+
+  const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+  reply.raw.writeHead(200, {
+    'Content-Type': 'audio/mpeg',
+    'Cache-Control': 'public, max-age=86400',
+    'Transfer-Encoding': 'chunked'
+  });
+
+  ffmpeg.stdout.pipe(reply.raw);
+  ffmpeg.stderr.on('data', () => {});
+  req.raw.on('close', () => {
+    try { ffmpeg.kill('SIGKILL'); } catch (e) {}
+  });
+});
+
+// 4.10 Track Audio Stream (/api/audio/stream/:id)
+fastify.get('/api/audio/stream/:id', async (req, reply) => {
+  const { id } = req.params;
+  const { q, duration } = req.query;
+  let query = q;
+
+  if (!query) {
+    try {
+      const trackData = await spotifyBff.getTrack(id);
+      const t = trackData?.data?.trackUnion;
+      if (t) {
+        query = `${t.name} ${t.firstArtist?.items?.[0]?.profile?.name || ''}`.trim();
+      }
+    } catch (e) {}
+  }
+  if (!query) {
+    query = id.replace('spotify:track:', '');
+  }
+
+  const directAudioUrl = await resolveAudioStream(query, duration ? Number(duration) : null);
+  if (!directAudioUrl) {
+    return reply.status(404).send({ error: 'Audio stream could not be resolved' });
+  }
+
+  const ffmpeg = spawn('ffmpeg', [
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+    '-i', directAudioUrl,
+    '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', '-f', 'mp3', '-'
+  ]);
+
+  reply.raw.writeHead(200, {
+    'Content-Type': 'audio/mpeg',
+    'Cache-Control': 'public, max-age=86400',
+    'Transfer-Encoding': 'chunked'
+  });
+
+  ffmpeg.stdout.pipe(reply.raw);
+  ffmpeg.stderr.on('data', () => {});
+  req.raw.on('close', () => {
+    try { ffmpeg.kill('SIGKILL'); } catch (e) {}
+  });
 });
 
 // 5. Local Library & SQLite Persistence
